@@ -1,4 +1,9 @@
+
+killall tmux
 date
+# testing internal sleep for 5 sec
+#5
+
 tty
 stty
 sleep 10 &
@@ -7,10 +12,20 @@ fg
 bg
 #test comments
 ls #another test comments
-#cd /proc
+cd /proc
 id
 
 #sudo -l
+man man
+  
+kkk
 
+q
+
+tmux
+#this is super secret!!!
+d
+
+#sleep 60
 exit
 
