@@ -29,8 +29,6 @@
 /* XXX
 
 	 - add an alarm timeout
-	 - add a user switch for changing context
-	 - add priv drop to user on shell side
 	 - add utmp and wtmp mangling. (man pututline / man updwtmp)
 
 	 XXX */
@@ -41,6 +39,7 @@
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,7 +54,6 @@
 #include <unistd.h>
 
 
-
 #define DEFAULT_SHELL	"/bin/bash"
 #define DEFAULT_MIMIC	"/bin/login --"
 #define DEFAULT_TIMEOUT 0
@@ -64,7 +62,7 @@
 #define DEFAULT_TERM "TERM=linux"
 
 
-int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp);
+int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp, struct passwd *pwent);
 void broker(FILE *keyboard, int shell_fd, int pause_secs);
 
 char **string_to_vector(char *command_string);
@@ -81,15 +79,19 @@ char *program_invocation_short_name;
 
 void usage(){
 
-	fprintf(stderr, "Usage: %s [-s SHELL][-m MIMIC][-t TIMEOUT][-p PAUSE][-k][-e TERMINAL] KEYBOARD\n", program_invocation_short_name);
-	fprintf(stderr, "\tKEYBOARD\t:\tKEYBOARD is the name of the program that will be executed to provide the user input that simulates keyboard interaction.\n");
+	fprintf(stderr, "Usage: %s [-s SHELL][-m MIMIC][-t TIMEOUT][-p PAUSE][-e TERMINAL][-u USER][-k] KEYBOARD\n", program_invocation_short_name);
+	fprintf(stderr, "\tKEYBOARD\t:\tKEYBOARD is the name of the \"keyboard script\" file that will simulate keyboard interaction.\n");
 	fprintf(stderr, "\t-s SHELL\t:\tSets the shell to use on the other end of the tty. (Default \"%s\".)\n", DEFAULT_SHELL);
 	fprintf(stderr, "\t-m MIMIC\t:\tSets the name of the shell's parent process. (Default \"%s\".)\n", DEFAULT_MIMIC);
 	fprintf(stderr, "\t-t TIMEOUT\t:\tSets a timeout (in seconds) for the interaction, at which point the tty is torn down. (Default \"%d\".)\n", DEFAULT_TIMEOUT);
 	fprintf(stderr, "\t-p PAUSE\t:\tSets the pause_secs (in seconds) between commands sent to the shell. (Default \"%d\".)\n", DEFAULT_PAUSE);
-	fprintf(stderr, "\t-k\t\t:\tSets keep-alive mode. After teardown of the tty, restart the interaction again. (Continues to respawn until killed.)\n");
 	fprintf(stderr, "\t-e TERMINAl\t:\tSets the TERM environment variable to TERM. (Default \"%s\".)\n", DEFAULT_TERM);
-	fprintf(stderr, "\t\t\t\tThe -e flag expects the full assignment. E.g. \"-e TERM=vt100\"\n");
+	fprintf(stderr, "\t-u USER\t\t:\tDrops privs to USER after forking child shell process.\n");
+	fprintf(stderr, "\t-k\t\t:\tSets keep-alive mode. After teardown of the tty, restart the interaction again. (Continues to respawn until killed.)\n");
+	fprintf(stderr, "\nNOTES:\n");
+	fprintf(stderr, "\t* The -e flag expects the full assignment. (e.g. \"-e TERM=vt100\")\n");
+	fprintf(stderr, "\t* %s will not attempt root things unless it is running as root. (e.g. uid changes, utmp/wtmp, etc.)\n", program_invocation_short_name);
+	fprintf(stderr, "\n");
 	exit(1);
 }
 
@@ -103,6 +105,7 @@ int main(int argc, char **argv){
 	struct termios saved_termios_attrs;
 	char **tmp_argv, **old_argv;
 	char *term_envp[2];
+	struct passwd *pwent = NULL;
 
 	int shell_fd;
 	FILE *keyboard;
@@ -114,6 +117,7 @@ int main(int argc, char **argv){
 	int pause_secs = DEFAULT_PAUSE;
 	unsigned short keepalive = 0;
 	char *term = DEFAULT_TERM;
+	char *user = NULL;
 
 
 	// First, we will be setting up mimic on ourselves, so lets copy argv off to the heap for future use.
@@ -156,7 +160,7 @@ int main(int argc, char **argv){
 	}
 
 
-	while((opt = getopt(argc, argv, "hs:m:t:kp:e:")) != -1){
+	while((opt = getopt(argc, argv, "hs:m:t:kp:e:u:")) != -1){
 		switch(opt){
 
 			case 's':
@@ -167,6 +171,10 @@ int main(int argc, char **argv){
 
 			case 'm':
 				mimic = optarg;
+				break;
+
+			case 'u':
+				user = optarg;
 				break;
 
 			case 'e':
@@ -215,12 +223,30 @@ int main(int argc, char **argv){
 	// setup our mimic lie.
 	memcpy(old_argv[0], mimic, strlen(mimic));
 
+
+	if(!getuid()){
+		if(user){
+			if((pwent = getpwnam(user)) == NULL){
+				if(errno){
+					fprintf(stderr, "%s: getpwnam(\"%s\"): %s\n", program_invocation_short_name, user, strerror(errno));
+				}else{
+					fprintf(stderr, "%s: getpwnam(\"%s\"): No such user.\n", program_invocation_short_name, user);
+				}
+				exit(1);
+			}
+		}
+
+	}else if(user){
+		fprintf(stderr, "%s: -u USER specified, but not running as root!\n", program_invocation_short_name);
+		exit(1);
+	}
+
+
 	/* Save our termio state for reuse later. */
 	if(tcgetattr(STDIN_FILENO, &saved_termios_attrs) == -1){
 		fprintf(stderr, "%s: tcgetattr(%d, %lx): %s\n", program_invocation_short_name, STDIN_FILENO, (unsigned long) &saved_termios_attrs, strerror(errno));
 		exit(1);
 	}
-
 
 	/* Quasi-daemonize, so we look like a normal login tty. */
 
@@ -244,13 +270,18 @@ int main(int argc, char **argv){
 
 	umask(0);
 
+	if(signal(SIGCHLD, SIG_IGN) == SIG_ERR){
+		fprintf(stderr, "%s: signal(SIGCHLD, SIG_IGN): %s\n", program_invocation_short_name, strerror(errno));
+		exit(1);
+	}
+
 
 	do {
 
 		/* Setup shell. */
 		term_envp[0] = term;
 		term_envp[1] = NULL;
-		shell_fd = setup_shell(shell, &saved_termios_attrs, term_envp);
+		shell_fd = setup_shell(shell, &saved_termios_attrs, term_envp, pwent);
 
 		/* Setup keyboard. */
 		if((keyboard = fopen(keyboard_file, "r")) == NULL){
@@ -274,7 +305,9 @@ int main(int argc, char **argv){
 	return(0);
 }
 
-int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp){
+
+
+int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp, struct passwd *pwent){
 
 	int retval;
 
@@ -334,6 +367,18 @@ int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp){
 		setsid();
 		ioctl(STDIN_FILENO, TIOCSCTTY, 1);
 
+		if(!getuid()){
+			if(pwent){
+				if(setregid(pwent->pw_gid, pwent->pw_gid) == -1){
+					fprintf(stderr, "%s: setregid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_gid, pwent->pw_gid, strerror(errno));
+					exit(1);
+				}
+				if(setreuid(pwent->pw_uid, pwent->pw_uid) == -1){
+					fprintf(stderr, "%s: setreuid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_uid, pwent->pw_uid, strerror(errno));
+					exit(1);
+				}
+			}
+		}
 		execve(shell[0], shell, envp);
 		exit(1);
 	}

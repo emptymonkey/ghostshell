@@ -1,5 +1,5 @@
-# usimd
-User Simulation Daemon
+# ghostshell
+This tool is a user simulation daemon.
 
 ## Purpose
 
