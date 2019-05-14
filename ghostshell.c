@@ -13,8 +13,8 @@
  *
  *  The setup will be as follows:
  *
- *    (file)            (UID root process)           (UID user process)
- *    Keyboard  <-fd->  Referee (Parent)    <-tty->  Shell (Child #2)
+ *    (file)           (UID root process)            (UID user process)
+ *    Keyboard  -fd->  Referee (Parent)    <-tty->   Shell (Child)
  *
  *  The Keyboard will be a file whose contents are sent down the tty as though
  *  typed by a user. The shell process will exec /bin/bash, with stdin, stdout,
@@ -22,7 +22,7 @@
  *
  *  Any lines in the keyboard script that start with '#' followed by only 
  *  digits, then closed out with the newline, will be interpreted as a time
- *  for the keyboard to sleep() before moving on to the next line.
+ *  for the keyboard to sleep before moving on to the next line.
  *
  ******************************************************************************/
 
@@ -51,6 +51,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 
@@ -73,8 +74,14 @@ char **string_to_vector(char *command_string);
 
 char *buff;
 long buff_len;
-
 char *program_invocation_short_name;
+
+volatile sig_atomic_t sig_found = 0;
+
+
+void signal_handler(int signal){
+  sig_found = signal;
+}
 
 
 void usage(){
@@ -106,6 +113,7 @@ int main(int argc, char **argv){
 	char **tmp_argv, **old_argv;
 	char *term_envp[2];
 	struct passwd *pwent = NULL;
+	struct sigaction act;
 
 	int shell_fd;
 	FILE *keyboard;
@@ -275,6 +283,13 @@ int main(int argc, char **argv){
 		exit(1);
 	}
 
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = signal_handler;
+	if(sigaction(SIGALRM, &act, NULL) == -1){
+		fprintf(stderr, "%s: sigaction(SIGALRM, %lx, NULL): %s\n", program_invocation_short_name, (unsigned long) &act, strerror(errno));
+		exit(1);
+	}
+
 
 	do {
 
@@ -290,7 +305,7 @@ int main(int argc, char **argv){
 		}
 
 		/* Setup alarm() and handler. */
-
+		alarm(timeout);
 
 		/* Broker. */
 		broker(keyboard, shell_fd, pause_secs);
@@ -397,6 +412,7 @@ void broker(FILE *keyboard, int shell_fd, int pause_secs){
 	int keyboard_sleep;
 
 	struct timeval tv;
+	struct timespec ts;
 
 
 	keyboard_active = 1;
@@ -407,12 +423,22 @@ void broker(FILE *keyboard, int shell_fd, int pause_secs){
 
 		tv.tv_sec = pause_secs;
 		tv.tv_usec = 0;
-
-		if((retval = select(shell_fd + 1, &read_fds, NULL, NULL, &tv)) == -1){
-			error(1, errno, "select()");
+	
+		// fall through if we received a signal on the previous loop.
+		if(!sig_found){
+			if(((retval = select(shell_fd + 1, &read_fds, NULL, NULL, &tv)) == -1) && !sig_found){
+				fprintf(stderr, "%s: select(%d + 1, %lx, NULL, NULL, %lx): %s\n", program_invocation_short_name, shell_fd, (unsigned long) &read_fds, (unsigned long) &tv, strerror(errno));
+				exit(1);
+			}
 		}
 
-		if(FD_ISSET(shell_fd, &read_fds)){
+		if(sig_found){
+
+			sig_found = 0;
+			// time to go home.
+			return;
+
+		}else if(FD_ISSET(shell_fd, &read_fds)){
 			if((io_bytes = read(shell_fd, buff, buff_len - 1)) == -1){
 				break;
 			}
@@ -421,6 +447,7 @@ void broker(FILE *keyboard, int shell_fd, int pause_secs){
 			}else{
 				buff[io_bytes] = '\0';
 				printf("%s", buff);
+				fflush(stdout);
 			}
 
 		}else{
@@ -443,10 +470,13 @@ void broker(FILE *keyboard, int shell_fd, int pause_secs){
 						}
 					}
 					if(keyboard_sleep){
-						sleep(keyboard_sleep);
+						ts.tv_sec = keyboard_sleep;
+						ts.tv_nsec = 0;
+						nanosleep(&ts, NULL);
 					}else{
 						if(write(shell_fd, buff, strnlen(buff, buff_len)) == -1){
-							error(1, errno, "write(%d, %lx, %ld)", shell_fd, (unsigned long) buff, strnlen(buff, buff_len));
+							fprintf(stderr, "%s: write(%d, %lx, %ld): %s\n", program_invocation_short_name, shell_fd, (unsigned long) buff, strnlen(buff, buff_len), strerror(errno));
+							exit(1);
 						}
 					}
 				}
