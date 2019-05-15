@@ -26,12 +26,6 @@
  *
  ******************************************************************************/
 
-/* XXX
-
-	 - add an alarm timeout
-	 - add utmp and wtmp mangling. (man pututline / man updwtmp)
-
-	 XXX */
 
 #define _XOPEN_SOURCE 700
 
@@ -53,6 +47,7 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <utmp.h>
 
 
 #define DEFAULT_SHELL	"/bin/bash"
@@ -61,15 +56,11 @@
 #define DEFAULT_PAUSE 2
 #define DEFAULT_LOGFILE "/root/usimd.out"
 #define DEFAULT_TERM "TERM=linux"
+#define DEFAULT_TTY_NAME "tty1"
 
 
-int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp, struct passwd *pwent);
 void broker(FILE *keyboard, int shell_fd, int pause_secs);
-
 char **string_to_vector(char *command_string);
-//void free_vector(char **vector);
-//int get_vector_size(char **vector);
-
 
 
 char *buff;
@@ -80,7 +71,7 @@ volatile sig_atomic_t sig_found = 0;
 
 
 void signal_handler(int signal){
-  sig_found = signal;
+	sig_found = signal;
 }
 
 
@@ -116,7 +107,10 @@ int main(int argc, char **argv){
 	struct sigaction act;
 
 	int shell_fd;
+	char *shell_tty_name;
+	int child_pid;
 	FILE *keyboard;
+	struct utmp ut;
 
 	char *keyboard_file;
 	char **shell = NULL;
@@ -231,22 +225,25 @@ int main(int argc, char **argv){
 	// setup our mimic lie.
 	memcpy(old_argv[0], mimic, strlen(mimic));
 
-
-	if(!getuid()){
-		if(user){
-			if((pwent = getpwnam(user)) == NULL){
-				if(errno){
-					fprintf(stderr, "%s: getpwnam(\"%s\"): %s\n", program_invocation_short_name, user, strerror(errno));
-				}else{
-					fprintf(stderr, "%s: getpwnam(\"%s\"): No such user.\n", program_invocation_short_name, user);
-				}
-				exit(1);
+	if(user){
+		if((pwent = getpwnam(user)) == NULL){
+			if(errno){
+				fprintf(stderr, "%s: getpwnam(\"%s\"): %s\n", program_invocation_short_name, user, strerror(errno));
+			}else{
+				fprintf(stderr, "%s: getpwnam(\"%s\"): No such user.\n", program_invocation_short_name, user);
 			}
+			exit(1);
 		}
-
-	}else if(user){
-		fprintf(stderr, "%s: -u USER specified, but not running as root!\n", program_invocation_short_name);
-		exit(1);
+	}else{
+		if((pwent = getpwuid(getuid())) == NULL){
+			if(errno){
+				fprintf(stderr, "%s: getpwuid(\"%d\"): %s\n", program_invocation_short_name, getuid(), strerror(errno));
+			}else{
+				fprintf(stderr, "%s: getpwuid(\"%d\"): Your system is having an existential crisis.\n", program_invocation_short_name, getuid());
+			}
+			exit(1);
+		}
+		user = pwent->pw_name;
 	}
 
 
@@ -293,10 +290,105 @@ int main(int argc, char **argv){
 
 	do {
 
-		/* Setup shell. */
-		term_envp[0] = term;
-		term_envp[1] = NULL;
-		shell_fd = setup_shell(shell, &saved_termios_attrs, term_envp, pwent);
+
+		if((shell_fd = posix_openpt(O_RDWR)) == -1){
+			fprintf(stderr, "%s: posix_openpt(O_RDWR): %s\n", program_invocation_short_name, strerror(errno));
+			exit(1);
+		}
+
+		if(grantpt(shell_fd)){
+			fprintf(stderr, "%s: grantpt(%d): %s\n", program_invocation_short_name, shell_fd, strerror(errno));
+			exit(1);
+		}
+
+		if(unlockpt(shell_fd)){
+			fprintf(stderr, "%s: unlockpt(%d): %s\n", program_invocation_short_name, shell_fd, strerror(errno));
+			exit(1);
+		}
+
+		if(tcsetattr(shell_fd, TCSANOW, &saved_termios_attrs) == -1){
+			fprintf(stderr, "%s: tcgetattr(%d, %lx): %s\n", program_invocation_short_name, shell_fd, (unsigned long) &saved_termios_attrs, strerror(errno));
+			exit(1);
+		}
+
+		if((shell_tty_name = ptsname(shell_fd)) == NULL){
+			fprintf(stderr, "%s: ptsname(%d): %s\n", program_invocation_short_name, shell_fd, strerror(errno));
+			exit(1);
+		}
+
+		if((retval = fork()) == -1){
+			fprintf(stderr, "%s: fork(): %s\n", program_invocation_short_name, strerror(errno));
+			exit(1);
+		}
+
+		if(!retval){
+
+			close(shell_fd);
+			close(STDIN_FILENO);
+			close(STDOUT_FILENO);
+			close(STDERR_FILENO);
+
+			if((retval = open(shell_tty_name, O_RDWR)) == -1){
+				exit(2); // no stderr to write to, so uniq() exit code.
+			}
+			dup2(retval, STDIN_FILENO);
+			dup2(retval, STDOUT_FILENO);
+			dup2(retval, STDERR_FILENO);
+
+			if(retval != STDIN_FILENO && retval != STDOUT_FILENO && retval != STDERR_FILENO){
+				close(retval);
+			}
+
+			// setsid() again, so we can set the new tty as our controlling tty.
+			// If these fail... well, let's be non-fatal. Maybe stuff will work out. :)
+			setsid();
+			ioctl(STDIN_FILENO, TIOCSCTTY, 1);
+
+			if(!getuid()){
+				if(pwent){
+					if(setregid(pwent->pw_gid, pwent->pw_gid) == -1){
+						fprintf(stderr, "%s: setregid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_gid, pwent->pw_gid, strerror(errno));
+						exit(1);
+					}
+					if(setreuid(pwent->pw_uid, pwent->pw_uid) == -1){
+						fprintf(stderr, "%s: setreuid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_uid, pwent->pw_uid, strerror(errno));
+						exit(1);
+					}
+				}
+			}
+
+			/* Setup shell. */
+			term_envp[0] = term;
+			term_envp[1] = NULL;
+
+			execve(shell[0], shell, term_envp);
+			exit(1);
+		}
+
+		child_pid = retval;
+
+
+		if(!getuid()){
+			memset(&ut, 0, sizeof(struct utmp));
+			ut.ut_type = USER_PROCESS;
+			ut.ut_pid = child_pid;
+
+			strncpy(ut.ut_line, shell_tty_name + 5, sizeof(ut.ut_line));
+			strncpy(ut.ut_id, shell_tty_name + (strlen(shell_tty_name) - 4), sizeof(ut.ut_id));
+			if(time((time_t *) &ut.ut_tv.tv_sec) == -1){
+				fprintf(stderr, "%s: time(%lx): %s\n", program_invocation_short_name, (unsigned long) &ut.ut_tv.tv_sec, strerror(errno));
+				exit(1);
+			}
+			strncpy(ut.ut_user, user, sizeof(ut.ut_user));
+			setutent();
+			if(pututline(&ut) == NULL){
+				fprintf(stderr, "%s: pututline(%lx): %s\n", program_invocation_short_name, (unsigned long) &ut, strerror(errno));
+				exit(1);
+			}
+			updwtmp(WTMP_FILE, &ut);
+			endutent();
+		}
+
 
 		/* Setup keyboard. */
 		if((keyboard = fopen(keyboard_file, "r")) == NULL){
@@ -304,11 +396,28 @@ int main(int argc, char **argv){
 			exit(1);
 		}
 
-		/* Setup alarm() and handler. */
+		/* Setup alarm(). */
 		alarm(timeout);
 
 		/* Broker. */
 		broker(keyboard, shell_fd, pause_secs);
+
+
+		if(!getuid()){
+			ut.ut_type = DEAD_PROCESS;
+			if(time((time_t *) &ut.ut_tv.tv_sec) == -1){
+				fprintf(stderr, "%s: time(%lx): %s\n", program_invocation_short_name, (unsigned long) &ut.ut_tv.tv_sec, strerror(errno));
+				exit(1);
+			}
+			memset(ut.ut_user, 0, sizeof(ut.ut_user));
+			setutent();
+			if(pututline(&ut) == NULL){
+				fprintf(stderr, "%s: pututline(%lx): %s\n", program_invocation_short_name, (unsigned long) &ut, strerror(errno));
+				exit(1);
+			}
+			updwtmp(WTMP_FILE, &ut);
+			endutent();
+		}
 
 		/* Clean up. */
 		alarm(0);
@@ -317,89 +426,10 @@ int main(int argc, char **argv){
 
 	} while(keepalive);
 
+
 	return(0);
 }
 
-
-
-int setup_shell(char **shell, struct termios *saved_termios_attrs, char **envp, struct passwd *pwent){
-
-	int retval;
-
-	int shell_fd;
-	char *shell_tty_name;
-
-	if((shell_fd = posix_openpt(O_RDWR)) == -1){
-		fprintf(stderr, "%s: posix_openpt(O_RDWR): %s\n", program_invocation_short_name, strerror(errno));
-		exit(1);
-	}
-
-	if(grantpt(shell_fd)){
-		fprintf(stderr, "%s: grantpt(%d): %s\n", program_invocation_short_name, shell_fd, strerror(errno));
-		exit(1);
-	}
-
-	if(unlockpt(shell_fd)){
-		fprintf(stderr, "%s: unlockpt(%d): %s\n", program_invocation_short_name, shell_fd, strerror(errno));
-		exit(1);
-	}
-
-	if(tcsetattr(shell_fd, TCSANOW, saved_termios_attrs) == -1){
-		fprintf(stderr, "%s: tcgetattr(%d, %lx): %s\n", program_invocation_short_name, shell_fd, (unsigned long) saved_termios_attrs, strerror(errno));
-		exit(1);
-	}
-
-	if((shell_tty_name = ptsname(shell_fd)) == NULL){
-		fprintf(stderr, "%s: ptsname(%d): %s\n", program_invocation_short_name, shell_fd, strerror(errno));
-		exit(1);
-	}
-
-	if((retval = fork()) == -1){
-		fprintf(stderr, "%s: fork(): %s\n", program_invocation_short_name, strerror(errno));
-		exit(1);
-	}
-
-	if(!retval){
-
-		close(shell_fd);
-		close(STDIN_FILENO);
-		close(STDOUT_FILENO);
-		close(STDERR_FILENO);
-
-		if((retval = open(shell_tty_name, O_RDWR)) == -1){
-			exit(2); // no stderr to write to, so uniq() exit code.
-		}
-		dup2(retval, STDIN_FILENO);
-		dup2(retval, STDOUT_FILENO);
-		dup2(retval, STDERR_FILENO);
-
-		if(retval != STDIN_FILENO && retval != STDOUT_FILENO && retval != STDERR_FILENO){
-			close(retval);
-		}
-
-		// setsid() again, so we can set the new tty as our controlling tty.
-		// If these fail... well, let's be non-fatal. Maybe stuff will work out. :)
-		setsid();
-		ioctl(STDIN_FILENO, TIOCSCTTY, 1);
-
-		if(!getuid()){
-			if(pwent){
-				if(setregid(pwent->pw_gid, pwent->pw_gid) == -1){
-					fprintf(stderr, "%s: setregid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_gid, pwent->pw_gid, strerror(errno));
-					exit(1);
-				}
-				if(setreuid(pwent->pw_uid, pwent->pw_uid) == -1){
-					fprintf(stderr, "%s: setreuid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_uid, pwent->pw_uid, strerror(errno));
-					exit(1);
-				}
-			}
-		}
-		execve(shell[0], shell, envp);
-		exit(1);
-	}
-
-	return(shell_fd);
-}
 
 void broker(FILE *keyboard, int shell_fd, int pause_secs){
 
@@ -423,7 +453,7 @@ void broker(FILE *keyboard, int shell_fd, int pause_secs){
 
 		tv.tv_sec = pause_secs;
 		tv.tv_usec = 0;
-	
+
 		// fall through if we received a signal on the previous loop.
 		if(!sig_found){
 			if(((retval = select(shell_fd + 1, &read_fds, NULL, NULL, &tv)) == -1) && !sig_found){
