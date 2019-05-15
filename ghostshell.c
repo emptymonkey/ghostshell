@@ -28,11 +28,13 @@
 
 
 #define _XOPEN_SOURCE 700
+#define _BSD_SOURCE
 
 #include <ctype.h>
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -329,15 +331,33 @@ int main(int argc, char **argv){
 
 			// Child code:
 
+			// open the submissive end of the tty
+			if((retval = open(shell_tty_name, O_RDWR)) == -1){
+				fprintf(stderr, "%s: open(%s, O_RDWR): %s\n", program_invocation_short_name, shell_tty_name, strerror(errno));
+				exit(1);
+			}
+
+			// If we're root, now is the time to switch to the target user.
+			if(!getuid()){
+				if(pwent){
+					initgroups(user, pwent->pw_gid);
+					if(setregid(pwent->pw_gid, pwent->pw_gid) == -1){
+						fprintf(stderr, "%s: setregid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_gid, pwent->pw_gid, strerror(errno));
+						exit(1);
+					}
+					if(setreuid(pwent->pw_uid, pwent->pw_uid) == -1){
+						fprintf(stderr, "%s: setreuid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_uid, pwent->pw_uid, strerror(errno));
+						exit(1);
+					}
+				}
+			}
+
 			// Setup the fds so they look "normal" for a new shell connected to new tty.
 			close(shell_fd);
 			close(STDIN_FILENO);
 			close(STDOUT_FILENO);
 			close(STDERR_FILENO);
 
-			if((retval = open(shell_tty_name, O_RDWR)) == -1){
-				exit(2); // no stderr to write to, so uniq() exit code.
-			}
 			dup2(retval, STDIN_FILENO);
 			dup2(retval, STDOUT_FILENO);
 			dup2(retval, STDERR_FILENO);
@@ -350,20 +370,6 @@ int main(int argc, char **argv){
 			// If these fail... well, let's be non-fatal. Maybe stuff will work out. :)
 			setsid();
 			ioctl(STDIN_FILENO, TIOCSCTTY, 1);
-
-			// If we're root, now is the time to switch to the target user.
-			if(!getuid()){
-				if(pwent){
-					if(setregid(pwent->pw_gid, pwent->pw_gid) == -1){
-						fprintf(stderr, "%s: setregid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_gid, pwent->pw_gid, strerror(errno));
-						exit(1);
-					}
-					if(setreuid(pwent->pw_uid, pwent->pw_uid) == -1){
-						fprintf(stderr, "%s: setreuid(%d, %d): %s\n", program_invocation_short_name, pwent->pw_uid, pwent->pw_uid, strerror(errno));
-						exit(1);
-					}
-				}
-			}
 
 			/* Setup the terminal environment variable. */
 			term_envp[0] = term;
@@ -397,7 +403,8 @@ int main(int argc, char **argv){
 				fprintf(stderr, "%s: pututline(%lx): %s\n", program_invocation_short_name, (unsigned long) &ut, strerror(errno));
 				exit(1);
 			}
-			updwtmp(WTMP_FILE, &ut);
+			// Here be dragons. 
+			//updwtmp(WTMP_FILE, &ut);
 			endutent();
 		}
 
