@@ -21,11 +21,10 @@ man man
 kkk
 
 q
-
 tmux
 #this is super secret!!!
 d
 
-#sleep 60
-exit
+
+less /etc/passwd
 

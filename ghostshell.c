@@ -5,24 +5,24 @@
  *
  *  The purpose of this program is to have an artificial user interaction with a 
  *  shell and tty in the background without requiring an actual login. This is
- *  useful for simulating a logged in user and bakeing that into an aws ami.
- *  I will be using this as part of a ctf to host the user shell / tty that is
- *  the ctf target. Yes, this is *very* close to what the expect program does.
- *  There are several differences that are important to this being a target in
- *  a ctf.
+ *  useful for simulating a logged in user. This may be useful for ctfs and
+ *  honeypots.
  *
  *  The setup will be as follows:
  *
  *    (file)           (UID root process)            (UID user process)
  *    Keyboard  -fd->  Referee (Parent)    <-tty->   Shell (Child)
  *
- *  The Keyboard will be a file whose contents are sent down the tty as though
- *  typed by a user. The shell process will exec /bin/bash, with stdin, stdout,
- *  and stderr all tied to the tty as one would expect. 
+ *  The "Keyboard" should be a file of contents to be sent down the tty as
+ *  though typed by a user. The "Shell" will exec /bin/bash, with stdin, stdout,
+ *  and stderr all tied to the new tty as one would expect. 
  *
  *  Any lines in the keyboard script that start with '#' followed by only 
  *  digits, then closed out with the newline, will be interpreted as a time
  *  for the keyboard to sleep before moving on to the next line.
+ *  
+ *  See the test file in this repository for an example of what a keyboard
+ *  script looks like.
  *
  ******************************************************************************/
 
@@ -155,6 +155,7 @@ int main(int argc, char **argv){
 	}
 
 
+	// Setup a global i/o buffer.
 	buff_len = sysconf(_SC_PAGESIZE);
 	if((buff = (char *) malloc(buff_len)) == NULL){
 		fprintf(stderr, "%s: malloc(%ld): %s\n", program_invocation_short_name, buff_len, strerror(errno));
@@ -162,6 +163,7 @@ int main(int argc, char **argv){
 	}
 
 
+	// process the options
 	while((opt = getopt(argc, argv, "hs:m:t:kp:e:u:")) != -1){
 		switch(opt){
 
@@ -225,6 +227,7 @@ int main(int argc, char **argv){
 	// setup our mimic lie.
 	memcpy(old_argv[0], mimic, strlen(mimic));
 
+	// ensure that user is properly set, even if it is just us.
 	if(user){
 		if((pwent = getpwnam(user)) == NULL){
 			if(errno){
@@ -246,7 +249,6 @@ int main(int argc, char **argv){
 		user = pwent->pw_name;
 	}
 
-
 	/* Save our termio state for reuse later. */
 	if(tcgetattr(STDIN_FILENO, &saved_termios_attrs) == -1){
 		fprintf(stderr, "%s: tcgetattr(%d, %lx): %s\n", program_invocation_short_name, STDIN_FILENO, (unsigned long) &saved_termios_attrs, strerror(errno));
@@ -254,7 +256,6 @@ int main(int argc, char **argv){
 	}
 
 	/* Quasi-daemonize, so we look like a normal login tty. */
-
 	if((retval = fork()) == -1){
 		fprintf(stderr, "%s: fork(): %s\n", program_invocation_short_name, strerror(errno));
 		exit(1);
@@ -272,9 +273,9 @@ int main(int argc, char **argv){
 		fprintf(stderr, "%s: chdir(\"/\"): %s\n", program_invocation_short_name, strerror(errno));
 		exit(1);
 	}
-
 	umask(0);
 
+	// When the shell exists, we won't be watching for it. Best ignore SIGCHLD.
 	if(signal(SIGCHLD, SIG_IGN) == SIG_ERR){
 		fprintf(stderr, "%s: signal(SIGCHLD, SIG_IGN): %s\n", program_invocation_short_name, strerror(errno));
 		exit(1);
@@ -288,9 +289,10 @@ int main(int argc, char **argv){
 	}
 
 
+	// Ready for the general handling loop.
 	do {
 
-
+		// Setup the new tty.
 		if((shell_fd = posix_openpt(O_RDWR)) == -1){
 			fprintf(stderr, "%s: posix_openpt(O_RDWR): %s\n", program_invocation_short_name, strerror(errno));
 			exit(1);
@@ -316,6 +318,8 @@ int main(int argc, char **argv){
 			exit(1);
 		}
 
+
+		// time to spawn child.
 		if((retval = fork()) == -1){
 			fprintf(stderr, "%s: fork(): %s\n", program_invocation_short_name, strerror(errno));
 			exit(1);
@@ -323,6 +327,9 @@ int main(int argc, char **argv){
 
 		if(!retval){
 
+			// Child code:
+
+			// Setup the fds so they look "normal" for a new shell connected to new tty.
 			close(shell_fd);
 			close(STDIN_FILENO);
 			close(STDOUT_FILENO);
@@ -344,6 +351,7 @@ int main(int argc, char **argv){
 			setsid();
 			ioctl(STDIN_FILENO, TIOCSCTTY, 1);
 
+			// If we're root, now is the time to switch to the target user.
 			if(!getuid()){
 				if(pwent){
 					if(setregid(pwent->pw_gid, pwent->pw_gid) == -1){
@@ -357,17 +365,21 @@ int main(int argc, char **argv){
 				}
 			}
 
-			/* Setup shell. */
+			/* Setup the terminal environment variable. */
 			term_envp[0] = term;
 			term_envp[1] = NULL;
 
+			// DO IT!
 			execve(shell[0], shell, term_envp);
 			exit(1);
 		}
 
+
+		// Parent code:
+
 		child_pid = retval;
 
-
+		// if we're root, time to show our login for 'w' and 'last'. (utmp/wtmp)
 		if(!getuid()){
 			memset(&ut, 0, sizeof(struct utmp));
 			ut.ut_type = USER_PROCESS;
@@ -389,8 +401,7 @@ int main(int argc, char **argv){
 			endutent();
 		}
 
-
-		/* Setup keyboard. */
+		/* Setup keyboard input. */
 		if((keyboard = fopen(keyboard_file, "r")) == NULL){
 			fprintf(stderr, "%s: fopen(\"%s\", \"r\"): %s\n", program_invocation_short_name, keyboard_file, strerror(errno));
 			exit(1);
@@ -399,10 +410,10 @@ int main(int argc, char **argv){
 		/* Setup alarm(). */
 		alarm(timeout);
 
-		/* Broker. */
+		/* Call the main broker() loop. Most of the actual work happens here. */
 		broker(keyboard, shell_fd, pause_secs);
 
-
+		// Record the logout in utmp/wtmp.
 		if(!getuid()){
 			ut.ut_type = DEAD_PROCESS;
 			if(time((time_t *) &ut.ut_tv.tv_sec) == -1){
@@ -431,6 +442,7 @@ int main(int argc, char **argv){
 }
 
 
+// I/O loop code.
 void broker(FILE *keyboard, int shell_fd, int pause_secs){
 
 	fd_set read_fds;
