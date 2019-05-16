@@ -57,7 +57,6 @@
 #define DEFAULT_TIMEOUT 0
 #define DEFAULT_PAUSE 2
 #define DEFAULT_TERM "TERM=linux"
-#define DEFAULT_TTY_NAME "tty1"
 
 
 void broker(FILE *keyboard, int shell_fd, int pause_secs);
