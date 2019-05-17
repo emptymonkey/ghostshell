@@ -250,10 +250,9 @@ int main(int argc, char **argv){
 	}
 
 	/* Save our termio state for reuse later. */
-	if(tcgetattr(STDIN_FILENO, &saved_termios_attrs) == -1){
-		fprintf(stderr, "%s: tcgetattr(%d, %lx): %s\n", program_invocation_short_name, STDIN_FILENO, (unsigned long) &saved_termios_attrs, strerror(errno));
-		exit(1);
-	}
+	// This will fail if not launched from a terminal, so it will be treated as best effort / non-fatal.
+	memset(&saved_termios_attrs, '\0', sizeof(struct termios));
+	tcgetattr(STDIN_FILENO, &saved_termios_attrs);
 
 	/* Quasi-daemonize, so we look like a normal login tty. */
 	if((retval = fork()) == -1){
