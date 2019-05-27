@@ -1,6 +1,3 @@
 # ghostshell
-This tool is a user simulation daemon.
 
-## Purpose
-
-This is a program that can be called out of cron that will simulate having a user logged in. Useful for baking into an aws ami that you're setting up for a ctf.
+This tool is a daemon designed to simualte a user sitting at a keyboard. (Show's up as "/bin/login --" by default.) This is useful for honeypots and CTF hosts.
